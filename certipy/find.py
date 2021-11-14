@@ -12,6 +12,7 @@
 #
 
 import argparse
+import json
 import logging
 import struct
 import time
@@ -125,10 +126,13 @@ class EnrollmentService:
         validity = ca_certificate["validity"].native
         self.validity_start = str(validity["not_before"])
         self.validity_end = str(validity["not_after"])
-
-        self.certificate_templates = list(
-            map(lambda x: x.decode(), entry.get_raw("certificateTemplates"))
-        )
+        
+        if entry.get_raw("certificateTemplates"):
+            self.certificate_templates = list(
+                map(lambda x: x.decode(), entry.get_raw("certificateTemplates"))
+            )
+        else:
+            self.certificate_templates = []
 
         # EDITF_ATTRIBUTESUBJECTALTNAME2
         self.user_specifies_san = (edit_flags & 0x00040000) == 0x00040000
@@ -194,7 +198,7 @@ class CertificateTemplate:
         self._has_vulnerable_acl = None
         self._vulnerable_reasons = []
         self._enrollee = None
-
+        self._vulnerable_technique_ids = []
         self.entry = entry
         self.instance = instance
 
@@ -276,6 +280,7 @@ class CertificateTemplate:
 
         vulnerable_acl = False
         aces = self.security_descriptor.aces
+        vulnerable_acl_sids = []
         for sid, rights in aces.items():
             if not is_low_priv_sid(sid) and sid not in self.instance.user_sids:
                 continue
@@ -290,12 +295,12 @@ class CertificateTemplate:
                     ACTIVE_DIRECTORY_RIGHTS.WRITE_PROPERTY,
                 ]
             ):
-                self._vulnerable_reasons.append(
-                    "%s has dangerous permissions"
-                    % (repr(self.instance.translate_sid(sid)),)
-                )
+                vulnerable_acl_sids.append(repr(self.instance.translate_sid(sid)))
                 vulnerable_acl = True
-
+        if vulnerable_acl:
+            self._vulnerable_reasons.append(
+                "%s has dangerous permissions" % ' & '.join(vulnerable_acl_sids)
+            )
         self._has_vulnerable_acl = vulnerable_acl
         return self._has_vulnerable_acl
 
@@ -330,6 +335,7 @@ class CertificateTemplate:
             self._vulnerable_reasons.append(
                 "Template is owned by %s" % repr(self.instance.translate_sid(owner_sid))
             )
+            self._vulnerable_technique_ids.append("ESC4")
             self._is_vulnerable = True
 
         user_can_enroll = self.can_enroll
@@ -337,6 +343,7 @@ class CertificateTemplate:
 
         if vulnerable_acl:
             self._is_vulnerable = True
+            self._vulnerable_technique_ids.append("ESC4")
 
         if self.requires_manager_approval:
             return False
@@ -363,6 +370,7 @@ class CertificateTemplate:
                     "authentication" % repr(self._enrollee)
                 )
             )
+            self._vulnerable_technique_ids.append("ESC1")
             self._is_vulnerable = True
 
         has_dangerous_eku = (
@@ -377,6 +385,7 @@ class CertificateTemplate:
             self._vulnerable_reasons.append(
                 ("%s can enroll and template has dangerous EKU" % repr(self._enrollee))
             )
+            self._vulnerable_technique_ids.append("ESC2")
             self._is_vulnerable = True
 
         return self._is_vulnerable
@@ -454,14 +463,16 @@ class CertificateTemplate:
 
         if len(self._vulnerable_reasons) > 0:
             output["Vulnerable Reasons"] = self._vulnerable_reasons
-
+        if len(self._vulnerable_technique_ids) > 0:
+            output["Vulnerable Technique IDs"] = self._vulnerable_technique_ids
         return output
 
 
 class Find:
     def __init__(self, options: argparse.Namespace, target: Target = None):
         self.options = options
-
+        if self.options.json:
+            logging.getLogger().setLevel(logging.WARNING)
         if target is None:
             self.target = Target(options)
         else:
@@ -549,8 +560,10 @@ class Find:
                 ] = "[!] Could not find any certificate templates"
             else:
                 output["Certificate Templates"] = certificate_templates
-
-        pretty_print(output)
+        if self.options.json:
+            print(json.dumps(output, indent=4))
+        else:
+            pretty_print(output)
 
     def translate_sid(self, sid: str) -> str:
         if sid in WELL_KNOWN_SIDS:
